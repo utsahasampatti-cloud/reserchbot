@@ -14,7 +14,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 UPLOAD_DIR = os.path.join(BASE_DIR, "uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-# Deal math
+# Deal math (tune later)
 EBAY_FEE_RATE = 0.13
 FIXED_COST_USD = 20.0
 MIN_PROFIT_USD = 60.0
@@ -22,13 +22,15 @@ MIN_ROI = 0.30
 
 app = FastAPI(title="Flea Assistant Backend (Resale Agent + UI Safe)")
 
+# DEV-friendly CORS (later: restrict to your Lovable domain)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # DEV only
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 def calc_deal(asking_price: float, resale_range: List[float]) -> Dict[str, Any]:
     low, high = float(resale_range[0]), float(resale_range[1])
@@ -44,6 +46,13 @@ def calc_deal(asking_price: float, resale_range: List[float]) -> Dict[str, Any]:
     else:
         verdict = "SKIP"
 
+    # Risk is heuristic; keep it simple for MVP
+    risk = "medium"
+    if "SKIP" in verdict:
+        risk = "high"
+    elif verdict == "BUY":
+        risk = "low"
+
     return {
         "resale_low_usd": round(low, 2),
         "resale_high_usd": round(high, 2),
@@ -52,15 +61,23 @@ def calc_deal(asking_price: float, resale_range: List[float]) -> Dict[str, Any]:
         "estimated_profit_usd": round(profit, 2),
         "roi": round(roi, 2),
         "verdict": verdict,
+        "risk_level": risk,
     }
 
-def as_fields(item: Dict[str, Any], market: Dict[str, Any], deal: Dict[str, Any], computed: Optional[Dict[str, Any]]) -> List[Dict[str, str]]:
-    # Always return an array of {label, value} with NO undefined entries
-    def add(label: str, value: Any):
+
+def as_fields(
+    item: Dict[str, Any],
+    market: Dict[str, Any],
+    deal: Dict[str, Any],
+    computed: Optional[Dict[str, Any]],
+) -> List[Dict[str, str]]:
+    # UI-safe: always array of {label, value}, no undefined
+    def add(label: str, value: Any) -> Dict[str, str]:
         v = "" if value is None else str(value).strip()
         return {"label": label, "value": v}
 
-    fields = []
+    fields: List[Dict[str, str]] = []
+
     fields.append(add("Name", item.get("name")))
     fields.append(add("Brand", item.get("brand")))
     fields.append(add("Model", item.get("model")))
@@ -82,12 +99,8 @@ def as_fields(item: Dict[str, Any], market: Dict[str, Any], deal: Dict[str, Any]
         fields.append(add("Profit (USD)", computed.get("estimated_profit_usd")))
         fields.append(add("ROI", computed.get("roi")))
 
-    # Ensure no item is None/undefined
     return [f for f in fields if isinstance(f, dict) and "label" in f and "value" in f]
 
-@app.get("/health")
-def health():
-    return {"ok": True}
 
 @app.post("/api/debug-upload")
 async def debug_upload(
@@ -101,6 +114,7 @@ async def debug_upload(
         "hint": hint,
     }
 
+
 @app.post("/api/describe")
 async def describe(
     image: UploadFile = File(...),
@@ -110,10 +124,11 @@ async def describe(
     img_bytes = await image.read()
 
     ext = os.path.splitext(image.filename or "")[1]
-    safe_name = f"{uuid.uuid4().hex}{ext}"
+    safe_name = f"{uuid.uuid4().hex}{ext if ext else '.png'}"
     with open(os.path.join(UPLOAD_DIR, safe_name), "wb") as f:
         f.write(img_bytes)
 
+    # Vision/agent call
     hint2 = hint.strip()
     if asking_price_usd is not None:
         hint2 = (hint2 + f"\nPurchase price offered now: {asking_price_usd} USD").strip()
@@ -127,39 +142,52 @@ async def describe(
 
     price_range = market.get("resale_price_range_usd")
     computed = None
+
     if asking_price_usd is not None and isinstance(price_range, list) and len(price_range) == 2:
         computed = calc_deal(float(asking_price_usd), price_range)
         deal["asking_price_usd"] = float(asking_price_usd)
         deal["estimated_profit_usd"] = computed["estimated_profit_usd"]
         deal["roi"] = computed["roi"]
         deal["net_resale_usd"] = computed["net_resale_usd"]
+        deal["risk_level"] = computed["risk_level"]
         deal["verdict"] = computed["verdict"]
+    else:
+        # keep whatever agent put; but ensure keys exist for UI
+        deal.setdefault("asking_price_usd", None)
+        deal.setdefault("estimated_profit_usd", None)
+        deal.setdefault("risk_level", deal.get("risk_level", "medium"))
+        deal.setdefault("verdict", deal.get("verdict", "BUY IF NEGOTIATED LOWER"))
 
-    summary_lines = []
-    headline = " ".join([x for x in [item.get("brand"), item.get("model"), item.get("name")] if x]).strip() or "Item"
-    summary_lines.append(headline)
+    # Build summary for right panel
+    summary_lines: List[str] = []
+    headline = " ".join([x for x in [item.get("brand"), item.get("model"), item.get("name")] if x]).strip()
+    summary_lines.append(headline or "Item")
 
     if item.get("condition"):
         summary_lines.append(f"Condition (visible): {item['condition']}")
 
     if isinstance(price_range, list) and len(price_range) == 2:
-        summary_lines.append(f"Estimated resale range: ${price_range[0]}–${price_range[1]} USD (confidence: {market.get('confidence','?')})")
+        summary_lines.append(
+            f"Estimated resale range: ${price_range[0]}–${price_range[1]} USD (confidence: {market.get('confidence','?')})"
+        )
 
     if asking_price_usd is None:
         summary_lines.append("How much can you buy this item for right now?")
     else:
         if computed:
             summary_lines.append(f"Verdict: {computed['verdict']}")
-            summary_lines.append(f"Profit: ${computed['estimated_profit_usd']} USD | ROI: {computed['roi']} | Net resale: ${computed['net_resale_usd']} USD")
+            summary_lines.append(
+                f"Profit: ${computed['estimated_profit_usd']} USD | ROI: {computed['roi']} | Net resale: ${computed['net_resale_usd']} USD"
+            )
 
-    if deal.get("risk_level"):
-        summary_lines.append(f"Risk: {deal['risk_level']}")
+    summary_lines.append(f"Risk: {deal.get('risk_level', 'medium')}")
+
     if msg:
         summary_lines.append(msg)
 
     return {
         "ui": {
-            "fields": as_fields(item, market, deal, computed),   # <- Lovable should render this list
+            "fields": as_fields(item, market, deal, computed),
             "summary": "\n".join([s for s in summary_lines if s]),
         },
         "data": {
@@ -173,12 +201,14 @@ async def describe(
             "filename": safe_name,
             "path": f"uploads/{safe_name}",
         },
-        @app.get("/")
+    }
+
+
+@app.get("/")
 def root():
     return {"ok": True, "service": "flea-backend"}
+
 
 @app.get("/health")
 def health():
     return {"ok": True}
-
-
