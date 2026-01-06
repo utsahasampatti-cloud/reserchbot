@@ -174,3 +174,11 @@ async def describe(
             "path": f"uploads/{safe_name}",
         },
     }
+    @app.get("/")
+def root():
+    return {"ok": True, "service": "flea-backend"}
+
+@app.get("/health")
+def health():
+    return {"ok": True}
+
