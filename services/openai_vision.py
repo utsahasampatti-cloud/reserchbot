@@ -1,135 +1,183 @@
-# services/openai_vision.py
-from __future__ import annotations
-
-import base64
 import os
-from typing import Any, Dict, List, Optional, Tuple
+import json
+import base64
+from typing import List, Optional, Dict, Any
 
 from openai import OpenAI
 
 
-def _b64_data_url(image_bytes: bytes, mime: str) -> str:
-    b64 = base64.b64encode(image_bytes).decode("utf-8")
-    return f"data:{mime};base64,{b64}"
+def _b64_data_url(content_type: str, data: bytes) -> str:
+    b64 = base64.b64encode(data).decode("utf-8")
+    ct = content_type or "image/jpeg"
+    return f"data:{ct};base64,{b64}"
 
 
-def _safe_float(x: Any) -> Optional[float]:
+def _safe_float(x) -> Optional[float]:
     try:
         if x is None:
             return None
-        s = str(x).strip().replace(",", ".")
-        if s == "":
-            return None
-        return float(s)
+        return float(x)
     except Exception:
         return None
 
 
-SYSTEM_PROMPT = """Act as a personal resale assistant for European flea markets and second-hand finds.
-Be conservative. Protect the user's money and time.
-
-Return ONLY valid JSON in the exact structure:
-
-{
-  "item": {"name":"...","brand":"...","model":"...","condition":"..."},
-  "market_estimate": {"resale_price_range_usd":[low,high],"confidence":"low|medium|high"},
-  "deal_analysis": {"verdict":"BUY|BUY IF NEGOTIATED LOWER|SKIP","risk_level":"low|medium|high"},
-  "assistant_message":"..."
-}
-
-Rules:
-- If you cannot reliably identify the item, set confidence='low' and widen the range.
-- Never recommend BUY unless margin is clearly profitable and risks manageable.
-- Keep assistant_message short, direct, street-smart. No emojis.
-"""
-
-
-def call_vision_pricing(
-    images: List[Tuple[bytes, str]],  # list of (bytes, mime)
+def analyze_with_openai(
+    images: List[Dict[str, Any]],
     hint: Optional[str] = None,
     asking_price: Optional[float] = None,
-    currency: str = "USD",
-    language: str = "en",
-    mode: str = "quick",
-    timeout_sec: int = 45,
+    deep: bool = False,
+    platform: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    images: list of (image_bytes, mime)
-    mode: quick|deep (deep = slightly longer instructions, still same schema)
+    Returns dict with:
+    {
+      "ui": { "fields": {...}, "summary": "..." }
+    }
+    Always keep it UI-safe.
     """
-    api_key = os.environ.get("OPENAI_API_KEY", "").strip()
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
     if not api_key:
-        raise RuntimeError("OPENAI_API_KEY is missing")
+        return {
+            "ui": {
+                "fields": {
+                    "Item": "Temporary fallback",
+                    "Condition": "unknown",
+                    "Resale Price Range": "$0 — $0",
+                    "Confidence": "low",
+                    "Risk Level": "low",
+                    "Verdict": "SKIP",
+                },
+                "summary": "OpenAI key is not configured (safe mode).",
+            }
+        }
 
     client = OpenAI(api_key=api_key)
 
-    user_context = {
-        "hint": hint or "",
-        "asking_price": asking_price,
-        "currency": currency,
-        "language": language,
-        "mode": mode,
-        "notes": "User may provide multiple photos of the same item from different angles. Use all of them.",
-    }
+    model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
-    if mode == "deep":
-        extra = (
-            "DEEP MODE: use multiple photos to reduce uncertainty; "
-            "if still uncertain, explicitly say so and widen the range."
-        )
-    else:
-        extra = "QUICK MODE: keep it fast, conservative."
+    # Build vision messages
+    content = []
+    text_bits = []
+    text_bits.append("You are a street-smart resale assistant for European flea markets.")
+    text_bits.append("Analyze the photos and return ONLY valid JSON matching the schema.")
+    if hint:
+        text_bits.append(f"User hint: {hint}")
+    if asking_price is not None:
+        text_bits.append(f"Asking price (user typed): {asking_price} USD (treat as what seller asks).")
 
-    # Build multi-modal content: text + many images
-    content: List[Dict[str, Any]] = [
-        {
-            "type": "text",
-            "text": (
-                f"{extra}\n"
-                f"User context: {user_context}\n\n"
-                "Now analyze the item from the photos and return the required JSON."
-            ),
-        }
-    ]
-
-    for (img_bytes, mime) in images[:8]:  # cap to 8 images
+    # multi-image: attach all
+    for img in images[:6]:
         content.append(
-            {"type": "image_url", "image_url": {"url": _b64_data_url(img_bytes, mime)}}
+            {
+                "type": "image_url",
+                "image_url": {"url": _b64_data_url(img.get("content_type") or "image/jpeg", img["bytes"])},
+            }
         )
 
+    content.insert(0, {"type": "text", "text": "\n".join(text_bits)})
+
+    system_prompt = """
+You are not a chatbot. You are a conservative, experienced reseller.
+Return ONLY JSON. No markdown. No extra text.
+If unsure, widen ranges and set low confidence.
+
+OUTPUT JSON STRUCTURE:
+{
+  "item": { "name": "...", "brand": "unknown|...", "model": "unknown|...", "condition": "..." },
+  "market_estimate": { "resale_price_range_usd": [low, high], "confidence": "low|medium|high" },
+  "deal_analysis": { "verdict": "BUY|BUY IF NEGOTIATED LOWER|SKIP", "risk_level": "low|medium|high" },
+  "assistant_message": "short practical advice"
+}
+
+Rules:
+- conservative prices
+- if asking_price provided: verdict must react to margin
+"""
+
+    # Ask OpenAI (chat.completions is stable)
     resp = client.chat.completions.create(
-        model="gpt-4o-mini",
+        model=model,
         temperature=0.2,
-        response_format={"type": "json_object"},
         messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": system_prompt.strip()},
             {"role": "user", "content": content},
         ],
-        timeout=timeout_sec,
     )
 
-    txt = resp.choices[0].message.content or "{}"
+    raw = resp.choices[0].message.content or "{}"
 
-    # txt is JSON string already (response_format=json_object), but keep safe:
-    import json
+    # Parse JSON safely
+    data = None
+    try:
+        data = json.loads(raw)
+    except Exception:
+        # If model returned garbage, safe fallback
+        return {
+            "ui": {
+                "fields": {
+                    "Item": "Unknown (parse error)",
+                    "Condition": "unknown",
+                    "Resale Price Range": "$0 — $0",
+                    "Confidence": "low",
+                    "Risk Level": "high",
+                    "Verdict": "SKIP",
+                },
+                "summary": "Could not parse AI response. Try again with clearer photo(s).",
+            }
+        }
 
-    data = json.loads(txt)
+    # Normalize to UI
+    item = data.get("item") or {}
+    market = data.get("market_estimate") or {}
+    deal = data.get("deal_analysis") or {}
 
-    # Normalize + guard
-    low_high = data.get("market_estimate", {}).get("resale_price_range_usd", [0, 0])
-    if not isinstance(low_high, list) or len(low_high) != 2:
-        low_high = [0, 0]
+    rng = market.get("resale_price_range_usd") or [0, 0]
+    try:
+        low = float(rng[0])
+        high = float(rng[1])
+    except Exception:
+        low, high = 0.0, 0.0
 
-    low = _safe_float(low_high[0]) or 0.0
-    high = _safe_float(low_high[1]) or 0.0
-    if high < low:
-        low, high = high, low
+    verdict = (deal.get("verdict") or "SKIP").upper()
+    if verdict not in ["BUY", "BUY IF NEGOTIATED LOWER", "SKIP"]:
+        verdict = "SKIP"
 
-    data.setdefault("item", {})
-    data.setdefault("market_estimate", {})
-    data.setdefault("deal_analysis", {})
-    data.setdefault("assistant_message", "")
+    confidence = (market.get("confidence") or "low").lower()
+    if confidence not in ["low", "medium", "high"]:
+        confidence = "low"
 
-    data["market_estimate"]["resale_price_range_usd"] = [round(low, 2), round(high, 2)]
+    risk_level = (deal.get("risk_level") or "medium").lower()
+    if risk_level not in ["low", "medium", "high"]:
+        risk_level = "medium"
 
-    return data
+    name = item.get("name") or "Unknown item"
+    condition = item.get("condition") or "unknown"
+
+    # display range
+    def fmt_money(x: float) -> str:
+        if x.is_integer():
+            return str(int(x))
+        return f"{x:.0f}"
+
+    price_str = f"${fmt_money(low)} — ${fmt_money(high)}"
+
+    # summary text
+    advice = data.get("assistant_message") or "—"
+
+    # OPTIONAL: add Deep Research CTA hint via summary only (front can show a button)
+    if confidence in ["low", "medium"] and not deep:
+        advice = advice.strip() + " | Можеш натиснути “Копати глибше” і додати ще фото для точнішої ціни."
+
+    return {
+        "ui": {
+            "fields": {
+                "Item": name,
+                "Condition": condition,
+                "Resale Price Range": price_str,
+                "Confidence": confidence,
+                "Risk Level": risk_level,
+                "Verdict": verdict,
+            },
+            "summary": advice,
+        }
+    }
