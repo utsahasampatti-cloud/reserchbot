@@ -1,81 +1,73 @@
-from __future__ import annotations
-
-import base64
+# services/openai_vision.py
 import os
-from typing import Any, Dict, List
-
+import base64
+import json
 from openai import OpenAI
 
 
-SYSTEM_PROMPT = """
-You are a street-smart resale assistant.
-Return ONLY valid JSON.
-Be conservative. If unsure, widen ranges and set confidence low.
-Never promise profit.
-"""
+def _b64(img: bytes) -> str:
+    return base64.b64encode(img).decode("utf-8")
 
-USER_PROMPT = """
-Analyze the item in the photo(s). Identify: name, brand, model if possible, and visible condition.
 
-Then produce a conservative resale price range in USD for online resale (rough estimate).
-Confidence: low/medium/high.
+def vision_quick_sniff(openai_images: list[dict], hint: str | None = None) -> dict:
+    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-Return JSON exactly in this shape:
+    system_prompt = """
+You are a resale assistant for flea market finds.
+Analyze the photos and return ONLY valid JSON.
+
+Schema:
 {
-  "item": {"name":": "...", "brand": "...", "model": "...", "condition": "..."},
-  "market_estimate": {"resale_price_range_usd": [low, high], "confidence": "low|medium|high"},
-  "risk_level": "low|medium|high",
-  "notes": ["..."]
+  "item": {
+    "name": string,
+    "brand": string,
+    "model": string,
+    "condition": string
+  },
+  "market_estimate": {
+    "resale_price_range_usd": [number, number],
+    "confidence": "low|medium|high"
+  },
+  "deal_analysis": {
+    "verdict": "BUY|BUY IF NEGOTIATED LOWER|SKIP",
+    "risk_level": "low|medium|high"
+  },
+  "assistant_message": string
 }
+
+Rules:
+- Conservative estimates
+- No hype
+- If unsure → wide range + low confidence
 """
 
+    content = [{"type": "text", "text": hint or "Analyze item for resale value"}]
 
-def _b64_data_url(image_bytes: bytes, content_type: str) -> str:
-    b64 = base64.b64encode(image_bytes).decode("utf-8")
-    return f"data:{content_type};base64,{b64}"
+    for img in openai_images:
+        content.append({
+            "type": "image_url",
+            "image_url": {
+                "url": f"data:{img.get('content_type','image/jpeg')};base64,{_b64(img['bytes'])}"
+            }
+        })
 
-
-def build_queries(item: Dict[str, Any], hint: str = "") -> List[str]:
-    name = (item.get("name") or "").strip()
-    brand = (item.get("brand") or "").strip()
-    model = (item.get("model") or "").strip()
-    base = " ".join([brand, name, model]).strip()
-    hint = (hint or "").strip()
-
-    q1 = " ".join([base, "used"]).strip()
-    q2 = " ".join([base, hint]).strip()
-    q3 = " ".join([brand, name, "unlocked"]).strip()
-
-    queries = []
-    for q in [q1, q2, q3]:
-        q = " ".join(q.split())
-        if q and q.lower() not in {x.lower() for x in queries}:
-            queries.append(q)
-    return queries[:3]
-
-
-def vision_quick_sniff(images: List[Dict[str, str]]) -> Dict[str, Any]:
-    """
-    images: [{"data_url": "...", "filename": "..."}]
-    """
-    api_key = os.environ.get("OPENAI_API_KEY")
-    if not api_key:
-        raise RuntimeError("OPENAI_API_KEY is not set")
-
-    client = OpenAI(api_key=api_key)
-
-    content = [{"type": "input_text", "text": USER_PROMPT}]
-    for img in images[:5]:
-        content.append({"type": "input_image", "image_url": img["data_url"]})
-
-    resp = client.responses.create(
-        model="gpt-4.1-mini",
-        input=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": content},
+    response = client.chat.completions.create(
+        model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": content}
         ],
+        temperature=0.2
     )
 
-    text = resp.output_text.strip()
-    # model returns JSON text — parse defensively in main.py
-    return {"raw_json_text": text}
+    raw = response.choices[0].message.content
+
+    try:
+        return json.loads(raw)
+    except Exception:
+        return {
+            "item": {"name": "unknown", "brand": "unknown", "model": "unknown", "condition": "unknown"},
+            "market_estimate": {"resale_price_range_usd": [0, 0], "confidence": "low"},
+            "deal_analysis": {"verdict": "SKIP", "risk_level": "high"},
+            "assistant_message": "Could not confidently analyze this item."
+        }
