@@ -1,33 +1,19 @@
+# services/openai_vision.py
+from __future__ import annotations
+
+import base64
 import os
-import json
-from typing import List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
-from fastapi import FastAPI, UploadFile, File, Form
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from openai import OpenAI
 
-from services.openai_vision import vision_quick_sniff
 
-app = FastAPI()
+def _b64_data_url(image_bytes: bytes, mime: str) -> str:
+    b64 = base64.b64encode(image_bytes).decode("utf-8")
+    return f"data:{mime};base64,{b64}"
 
-# --- CORS (для Lovable / mobile / web) ---
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
-# --- Utils ---
-def _safe(val, fallback="unknown"):
-    if val is None:
-        return fallback
-    if isinstance(val, str) and val.strip() == "":
-        return fallback
-    return val
-
-def _to_float_or_none(x):
+def _safe_float(x: Any) -> Optional[float]:
     try:
         if x is None:
             return None
@@ -39,131 +25,111 @@ def _to_float_or_none(x):
         return None
 
 
-# --- Health ---
-@app.get("/health")
-def health():
-    return {"ok": True, "service": "treasure-sniffer-backend"}
+SYSTEM_PROMPT = """Act as a personal resale assistant for European flea markets and second-hand finds.
+Be conservative. Protect the user's money and time.
+
+Return ONLY valid JSON in the exact structure:
+
+{
+  "item": {"name":"...","brand":"...","model":"...","condition":"..."},
+  "market_estimate": {"resale_price_range_usd":[low,high],"confidence":"low|medium|high"},
+  "deal_analysis": {"verdict":"BUY|BUY IF NEGOTIATED LOWER|SKIP","risk_level":"low|medium|high"},
+  "assistant_message":"..."
+}
+
+Rules:
+- If you cannot reliably identify the item, set confidence='low' and widen the range.
+- Never recommend BUY unless margin is clearly profitable and risks manageable.
+- Keep assistant_message short, direct, street-smart. No emojis.
+"""
 
 
-# --- Main API ---
-@app.post("/api/describe")
-async def describe(
-    images: List[UploadFile] = File(...),
-    hint: Optional[str] = Form(None),
-    asking_price: Optional[str] = Form(None),
-    language: Optional[str] = Form("en"),
-):
-    if not images or len(images) == 0:
-        return JSONResponse(
-            status_code=422,
-            content={"error": "NO_IMAGES", "message": "At least one image is required"},
+def call_vision_pricing(
+    images: List[Tuple[bytes, str]],  # list of (bytes, mime)
+    hint: Optional[str] = None,
+    asking_price: Optional[float] = None,
+    currency: str = "USD",
+    language: str = "en",
+    mode: str = "quick",
+    timeout_sec: int = 45,
+) -> Dict[str, Any]:
+    """
+    images: list of (image_bytes, mime)
+    mode: quick|deep (deep = slightly longer instructions, still same schema)
+    """
+    api_key = os.environ.get("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY is missing")
+
+    client = OpenAI(api_key=api_key)
+
+    user_context = {
+        "hint": hint or "",
+        "asking_price": asking_price,
+        "currency": currency,
+        "language": language,
+        "mode": mode,
+        "notes": "User may provide multiple photos of the same item from different angles. Use all of them.",
+    }
+
+    if mode == "deep":
+        extra = (
+            "DEEP MODE: use multiple photos to reduce uncertainty; "
+            "if still uncertain, explicitly say so and widen the range."
         )
+    else:
+        extra = "QUICK MODE: keep it fast, conservative."
 
-    # read image bytes
-    image_blobs = []
-    for img in images:
-        try:
-            data = await img.read()
-            image_blobs.append({
-                "filename": img.filename,
-                "content_type": img.content_type,
-                "bytes": data,
-            })
-        except Exception:
-            pass
-
-    if not image_blobs:
-        return JSONResponse(
-            status_code=422,
-            content={"error": "IMAGE_READ_FAILED"},
-        )
-
-    asking_price_val = _to_float_or_none(asking_price)
-
-    # --- Vision + reasoning ---
-    try:
-        ai_result = vision_quick_sniff(
-            images=image_blobs,
-            hint=hint,
-            asking_price=asking_price_val,
-            language=language,
-        )
-    except Exception as e:
-        return JSONResponse(
-            status_code=500,
-            content={
-                "error": "VISION_FAILED",
-                "message": str(e),
-            },
-        )
-
-    # --- Normalize response for UI ---
-    item = ai_result.get("item", {})
-    market = ai_result.get("market_estimate", {})
-    deal = ai_result.get("deal_analysis", {})
-
-    ui_fields = [
+    # Build multi-modal content: text + many images
+    content: List[Dict[str, Any]] = [
         {
-            "label": "Item",
-            "value": _safe(item.get("name")),
-        },
-        {
-            "label": "Condition",
-            "value": _safe(item.get("condition")),
-        },
-        {
-            "label": "Resale Price Range",
-            "value": (
-                f"${market['resale_price_range_usd'][0]} – ${market['resale_price_range_usd'][1]}"
-                if isinstance(market.get("resale_price_range_usd"), list)
-                else "unknown"
+            "type": "text",
+            "text": (
+                f"{extra}\n"
+                f"User context: {user_context}\n\n"
+                "Now analyze the item from the photos and return the required JSON."
             ),
-        },
-        {
-            "label": "Confidence",
-            "value": _safe(market.get("confidence")),
-        },
-        {
-            "label": "Risk Level",
-            "value": _safe(deal.get("risk_level")),
-        },
+        }
     ]
 
-    verdict = deal.get("verdict", "SKIP")
+    for (img_bytes, mime) in images[:8]:  # cap to 8 images
+        content.append(
+            {"type": "image_url", "image_url": {"url": _b64_data_url(img_bytes, mime)}}
+        )
 
-    ui_fields.insert(
-        0,
-        {
-            "label": "VERDICT",
-            "value": verdict,
-            "type": "verdict",
-        },
+    resp = client.chat.completions.create(
+        model="gpt-4o-mini",
+        temperature=0.2,
+        response_format={"type": "json_object"},
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": content},
+        ],
+        timeout=timeout_sec,
     )
 
-    return {
-        "ui": {
-            "fields": ui_fields,
-            "summary": _safe(ai_result.get("assistant_message"), ""),
-        },
-        "raw": ai_result,
-    }
+    txt = resp.choices[0].message.content or "{}"
 
+    # txt is JSON string already (response_format=json_object), but keep safe:
+    import json
 
-# --- Debug upload (optional but useful) ---
-@app.post("/api/debug-upload")
-async def debug_upload(
-    image: UploadFile = File(...),
-    hint: Optional[str] = Form(None),
-):
-    return {
-        "got_image": True,
-        "filename": image.filename,
-        "content_type": image.content_type,
-        "hint": hint,
-    }
+    data = json.loads(txt)
 
+    # Normalize + guard
+    low_high = data.get("market_estimate", {}).get("resale_price_range_usd", [0, 0])
+    if not isinstance(low_high, list) or len(low_high) != 2:
+        low_high = [0, 0]
 
-# --- Local run ---
-if name == "__main__":
-    import uvicorn port = int(os.environ.get("PORT", 8080))
-    uvicorn.run("main:app", host="0.0.0.0", port=port)
+    low = _safe_float(low_high[0]) or 0.0
+    high = _safe_float(low_high[1]) or 0.0
+    if high < low:
+        low, high = high, low
+
+    data.setdefault("item", {})
+    data.setdefault("market_estimate", {})
+    data.setdefault("deal_analysis", {})
+    data.setdefault("assistant_message", "")
+
+    data["market_estimate"]["resale_price_range_usd"] = [round(low, 2), round(high, 2)]
+
+    return data
